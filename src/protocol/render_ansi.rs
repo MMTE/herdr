@@ -1831,9 +1831,11 @@ mod tests {
         // host terminal can apply bidi reordering and Arabic-script shaping.
         assert!(output.contains("سلام"));
         assert!(output.contains("دنیا"));
-        // No cursor addressing inside the row after the first cell.
-        let tail = output.split("\x1b[1;1H").nth(1).unwrap_or(&output);
-        assert!(!tail.contains("\x1b[1;"));
+        // No cursor addressing anywhere between the RTL word and the ASCII
+        // tail (the trailing hidden-cursor park after the frame is expected).
+        let start = output.find("سلام").unwrap();
+        let end = start + output[start..].find("TESTING").unwrap() + "TESTING".len();
+        assert!(!output[start..end].contains('\x1b'));
     }
 
     #[test]
