@@ -29,7 +29,7 @@
 use std::cmp;
 use std::io::Write;
 
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::protocol::{
     underline_style_from_modifier, CellData, CursorState, FrameData, PaneSurfacePatchRow,
@@ -637,8 +637,7 @@ fn blit_patch_to(
                     &mut active_hyperlink,
                     frame,
                 );
-                next_inline_col = (cell.symbol.is_ascii() && cell_width(cell) == 1)
-                    .then_some(col.saturating_add(1));
+                next_inline_col = advances_one_column(cell).then_some(col.saturating_add(1));
             }
             to_skip = cell_width(cell).saturating_sub(1);
             let affected_width = cmp::max(cell_width(cell), cell_width(prev_cell));
@@ -752,6 +751,25 @@ fn cell_width(cell: &CellData) -> usize {
         return 2;
     }
     cell.symbol.width()
+}
+/// Whether writing this cell advances the host cursor by exactly one column,
+/// so the next cell may be written inline in the same output run.
+///
+/// ASCII qualifies, and so do other single-scalar width-1 symbols such as
+/// Persian, Hebrew, and Arabic letters: keeping them inline preserves the
+/// contiguous runs a host terminal needs to apply bidirectional reordering
+/// and Arabic-script shaping. Symbols whose advance could differ between
+/// terminals (East Asian ambiguous widths, multi-scalar grapheme clusters,
+/// wide cells) stay cursor-addressed to avoid column drift.
+fn advances_one_column(cell: &CellData) -> bool {
+    let mut chars = cell.symbol.chars();
+    let Some(ch) = chars.next() else {
+        return false;
+    };
+    if chars.next().is_some() {
+        return false;
+    }
+    UnicodeWidthChar::width(ch) == Some(1) && UnicodeWidthChar::width_cjk(ch) == Some(1)
 }
 
 fn is_halfwidth_katakana_voiced_grapheme(symbol: &str) -> bool {
@@ -890,8 +908,7 @@ fn write_all_cells(writer: &mut impl Write, frame: &FrameData) {
                 frame,
             );
             let width = cell_width(cell);
-            next_inline_col =
-                (cell.symbol.is_ascii() && width == 1).then_some(col.saturating_add(1));
+            next_inline_col = advances_one_column(cell).then_some(col.saturating_add(1));
             to_skip = width.saturating_sub(1);
         }
     }
@@ -1042,8 +1059,7 @@ fn write_changed_cells(writer: &mut impl Write, frame: &FrameData, prev: &FrameD
                     &mut active_hyperlink,
                     frame,
                 );
-                next_inline_col = (cell.symbol.is_ascii() && cell_width(cell) == 1)
-                    .then_some(col.saturating_add(1));
+                next_inline_col = advances_one_column(cell).then_some(col.saturating_add(1));
             }
 
             to_skip = cell_width(cell).saturating_sub(1);
@@ -1797,6 +1813,60 @@ mod tests {
 
         assert!(!output.contains("\x1b[2J"));
         assert!(output.bytes().filter(|byte| *byte == b'A').count() >= 6);
+    }
+
+    #[test]
+    fn full_redraw_writes_rtl_word_as_one_contiguous_run() {
+        // "سلام دنیا TESTING" laid out as logical-order cells in one row.
+        let word: Vec<CellData> = "سلام دنیا TESTING"
+            .chars()
+            .map(|ch| make_cell(&ch.to_string(), 0, 0, 0))
+            .collect();
+        let width = word.len() as u16;
+        let frame = make_frame(width, 1, word);
+        let encoded = BlitEncoder::new().encode(&frame, false);
+        let output = String::from_utf8(encoded.bytes).unwrap();
+
+        // The RTL word and the word/gap boundary must stay contiguous so the
+        // host terminal can apply bidi reordering and Arabic-script shaping.
+        assert!(output.contains("سلام"));
+        assert!(output.contains("دنیا"));
+        // No cursor addressing inside the row after the first cell.
+        let tail = output.split("\x1b[1;1H").nth(1).unwrap_or(&output);
+        assert!(!tail.contains("\x1b[1;"));
+    }
+
+    #[test]
+    fn diff_update_writes_rtl_word_as_one_contiguous_run() {
+        let text = "سلام دنیا";
+        let width = text.chars().count() as u16;
+        let prev = make_frame(width, 1, vec![make_cell(" ", 0, 0, 0); width as usize]);
+        let curr = make_frame(
+            width,
+            1,
+            text.chars()
+                .map(|ch| make_cell(&ch.to_string(), 0, 0, 0))
+                .collect(),
+        );
+        let mut encoder = BlitEncoder::new();
+        let initial = encoder.encode(&prev, false);
+        encoder.commit(prev, initial);
+
+        let encoded = encoder.encode(&curr, false);
+        let output = String::from_utf8(encoded.bytes).unwrap();
+        assert!(output.contains("سلام"));
+        assert!(output.contains("دنیا"));
+    }
+
+    #[test]
+    fn ambiguous_width_and_clusters_still_break_inline_runs() {
+        assert!(!advances_one_column(&make_cell("°", 0, 0, 0))); // EA ambiguous
+        assert!(!advances_one_column(&make_cell("e\u{301}", 0, 0, 0))); // cluster
+        assert!(!advances_one_column(&make_cell("提", 0, 0, 0))); // wide
+        assert!(!advances_one_column(&make_cell(WIDE_GRAPHEME, 0, 0, 0)));
+        assert!(advances_one_column(&make_cell("س", 0, 0, 0))); // Persian
+        assert!(advances_one_column(&make_cell("ש", 0, 0, 0))); // Hebrew
+        assert!(advances_one_column(&make_cell("A", 0, 0, 0))); // ASCII
     }
 
     #[test]
